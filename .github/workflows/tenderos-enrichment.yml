@@ -35,19 +35,35 @@ jobs:
           run_cycle() {
             cycle="$1"
             response_file="$(mktemp)"
-            http_code="$(
-              curl --silent --show-error \
-                --output "$response_file" \
-                --write-out "%{http_code}" \
-                --max-time 1200 \
-                --connect-timeout 30 \
-                --retry 2 \
-                --retry-delay 20 \
-                --retry-all-errors \
-                --request POST \
-                --header "X-TenderOS-Scheduler-Token: ${TENDEROS_SCHEDULER_TOKEN}" \
-                "$TENDEROS_RUN_URL"
-            )"
+
+            for lock_attempt in $(seq 1 30); do
+              http_code="$(
+                curl --silent --show-error \
+                  --output "$response_file" \
+                  --write-out "%{http_code}" \
+                  --max-time 1200 \
+                  --connect-timeout 30 \
+                  --retry 2 \
+                  --retry-delay 20 \
+                  --retry-all-errors \
+                  --request POST \
+                  --header "X-TenderOS-Scheduler-Token: ${TENDEROS_SCHEDULER_TOKEN}" \
+                  "$TENDEROS_RUN_URL"
+              )"
+
+              if [ "$http_code" != "409" ]; then
+                break
+              fi
+
+              echo "Cycle ${cycle}: authoritative DB lock busy (${lock_attempt}/30); waiting 30s."
+              cat "$response_file"
+              if [ "$lock_attempt" -eq 30 ]; then
+                echo "Cycle ${cycle}: DB lock remained busy for the full validation window."
+                rm -f "$response_file"
+                return 1
+              fi
+              sleep 30
+            done
 
             echo "=== TenderOS validation cycle ${cycle} ==="
             cat "$response_file"
