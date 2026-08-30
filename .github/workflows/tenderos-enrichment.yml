@@ -1,27 +1,77 @@
 name: TenderOS enrichment scheduler
 
 on:
+  push:
+    paths:
+      - ".github/workflows/tenderos-enrichment.yml"
   schedule:
-    - cron: "*/5 * * * *"
+    - cron: "23 */2 * * *"
   workflow_dispatch:
+    inputs:
+      mode:
+        description: "single or watchdog"
+        required: false
+        default: "single"
 
 permissions:
+  actions: write
   contents: read
-
-concurrency:
-  group: tenderos-production-enrichment
-  cancel-in-progress: false
 
 jobs:
   trigger:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 360
+
+    env:
+      TENDEROS_SCHEDULER_TOKEN: ${{ secrets.TENDEROS_SCHEDULER_TOKEN }}
+      TENDEROS_RUN_URL: https://tenderos-staging.onrender.com/internal/enrichment/scheduled-run
 
     steps:
-      - name: Run complete TenderOS enrichment cycle
-        env:
-          TENDEROS_SCHEDULER_TOKEN: ${{ secrets.TENDEROS_SCHEDULER_TOKEN }}
-          TENDEROS_RUN_URL: https://tenderos-staging.onrender.com/internal/enrichment/scheduled-run
+      - name: Validate three consecutive completed cycles
+        if: github.event_name == 'push'
+        run: |
+          set -euo pipefail
+
+          run_cycle() {
+            cycle="$1"
+            response_file="$(mktemp)"
+            http_code="$(
+              curl --silent --show-error \
+                --output "$response_file" \
+                --write-out "%{http_code}" \
+                --max-time 1200 \
+                --connect-timeout 30 \
+                --retry 2 \
+                --retry-delay 20 \
+                --retry-all-errors \
+                --request POST \
+                --header "X-TenderOS-Scheduler-Token: ${TENDEROS_SCHEDULER_TOKEN}" \
+                "$TENDEROS_RUN_URL"
+            )"
+
+            echo "=== TenderOS validation cycle ${cycle} ==="
+            cat "$response_file"
+
+            if [ "$http_code" != "200" ]; then
+              echo "Cycle ${cycle}: TenderOS returned HTTP $http_code; expected 200."
+              rm -f "$response_file"
+              return 1
+            fi
+            if ! grep -q '"status":"complete"' "$response_file"; then
+              echo "Cycle ${cycle}: response did not confirm status=complete."
+              rm -f "$response_file"
+              return 1
+            fi
+            rm -f "$response_file"
+            echo "Cycle ${cycle}: complete."
+          }
+
+          for cycle in 1 2 3; do
+            run_cycle "$cycle"
+          done
+
+      - name: Run one production cycle
+        if: github.event_name != 'push'
         run: |
           set -euo pipefail
 
@@ -32,7 +82,7 @@ jobs:
             curl --silent --show-error \
               --output "$response_file" \
               --write-out "%{http_code}" \
-              --max-time 840 \
+              --max-time 1200 \
               --connect-timeout 30 \
               --retry 2 \
               --retry-delay 20 \
@@ -44,14 +94,65 @@ jobs:
 
           cat "$response_file"
 
+          if [ "$http_code" = "409" ]; then
+            echo "Another authoritative enrichment cycle already owns the DB lock; overlap is healthy."
+            exit 0
+          fi
           if [ "$http_code" != "200" ]; then
             echo "TenderOS returned HTTP $http_code; expected 200 from a completed cycle."
             exit 1
           fi
-
           if ! grep -q '"status":"complete"' "$response_file"; then
             echo "TenderOS response did not confirm a completed cycle."
             exit 1
           fi
 
           echo "TenderOS enrichment completed successfully."
+
+      - name: Seed watchdog after validation
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          curl --fail-with-body --silent --show-error \
+            --request POST \
+            --header "Authorization: Bearer ${GH_TOKEN}" \
+            --header "Accept: application/vnd.github+json" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/workflows/tenderos-enrichment.yml/dispatches" \
+            --data '{"ref":"main","inputs":{"mode":"watchdog"}}'
+          echo "Watchdog seeded."
+
+      - name: Keep watchdog only while native cron is missing
+        if: github.event_name == 'workflow_dispatch' && inputs.mode == 'watchdog'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          watchdog_started="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          echo "Native GitHub schedule has not been trusted yet; watchdog sleeping before the next cycle."
+          sleep 6900
+
+          payload="$(
+            curl --fail-with-body --silent --show-error \
+              --header "Authorization: Bearer ${GH_TOKEN}" \
+              --header "Accept: application/vnd.github+json" \
+              --header "X-GitHub-Api-Version: 2022-11-28" \
+              "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/runs?event=schedule&per_page=10"
+          )"
+
+          native_runs="$(printf '%s' "$payload" | jq --arg since "$watchdog_started" '[.workflow_runs[] | select(.created_at >= $since)] | length')"
+          if [ "$native_runs" -gt 0 ]; then
+            echo "Native GitHub schedule produced a run after watchdog start; watchdog stops here."
+            exit 0
+          fi
+
+          curl --fail-with-body --silent --show-error \
+            --request POST \
+            --header "Authorization: Bearer ${GH_TOKEN}" \
+            --header "Accept: application/vnd.github+json" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/workflows/tenderos-enrichment.yml/dispatches" \
+            --data '{"ref":"main","inputs":{"mode":"watchdog"}}'
+          echo "No native schedule run observed; next watchdog cycle dispatched."
