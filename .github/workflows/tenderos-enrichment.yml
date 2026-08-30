@@ -2,7 +2,7 @@ name: TenderOS enrichment scheduler
 
 on:
   schedule:
-    - cron: "23 */2 * * *"
+    - cron: "*/5 * * * *"
   workflow_dispatch:
 
 permissions:
