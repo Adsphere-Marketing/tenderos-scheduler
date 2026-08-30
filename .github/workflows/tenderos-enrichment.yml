@@ -15,13 +15,13 @@ concurrency:
 jobs:
   trigger:
     runs-on: ubuntu-latest
-    timeout-minutes: 6
+    timeout-minutes: 15
 
     steps:
-      - name: Trigger TenderOS enrichment
+      - name: Run complete TenderOS enrichment cycle
         env:
           TENDEROS_SCHEDULER_TOKEN: ${{ secrets.TENDEROS_SCHEDULER_TOKEN }}
-          TENDEROS_KICK_URL: https://tenderos-staging.onrender.com/internal/enrichment/kick
+          TENDEROS_RUN_URL: https://tenderos-staging.onrender.com/internal/enrichment/scheduled-run
         run: |
           set -euo pipefail
 
@@ -32,21 +32,26 @@ jobs:
             curl --silent --show-error \
               --output "$response_file" \
               --write-out "%{http_code}" \
-              --max-time 180 \
-              --connect-timeout 20 \
+              --max-time 840 \
+              --connect-timeout 30 \
               --retry 2 \
               --retry-delay 20 \
               --retry-all-errors \
               --request POST \
               --header "X-TenderOS-Scheduler-Token: ${TENDEROS_SCHEDULER_TOKEN}" \
-              "$TENDEROS_KICK_URL"
+              "$TENDEROS_RUN_URL"
           )"
 
           cat "$response_file"
 
-          if [ "$http_code" != "202" ]; then
-            echo "TenderOS returned HTTP $http_code; expected 202."
+          if [ "$http_code" != "200" ]; then
+            echo "TenderOS returned HTTP $http_code; expected 200 from a completed cycle."
             exit 1
           fi
 
-          echo "TenderOS enrichment accepted successfully."
+          if ! grep -q '"status":"complete"' "$response_file"; then
+            echo "TenderOS response did not confirm a completed cycle."
+            exit 1
+          fi
+
+          echo "TenderOS enrichment completed successfully."
