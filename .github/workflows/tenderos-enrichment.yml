@@ -1,0 +1,52 @@
+name: TenderOS enrichment scheduler
+
+on:
+  schedule:
+    - cron: "23 */2 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tenderos-production-enrichment
+  cancel-in-progress: false
+
+jobs:
+  trigger:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+
+    steps:
+      - name: Trigger TenderOS enrichment
+        env:
+          TENDEROS_SCHEDULER_TOKEN: ${{ secrets.TENDEROS_SCHEDULER_TOKEN }}
+          TENDEROS_KICK_URL: https://tenderos-staging.onrender.com/internal/enrichment/kick
+        run: |
+          set -euo pipefail
+
+          response_file="$(mktemp)"
+          trap 'rm -f "$response_file"' EXIT
+
+          http_code="$(
+            curl --silent --show-error \
+              --output "$response_file" \
+              --write-out "%{http_code}" \
+              --max-time 180 \
+              --connect-timeout 20 \
+              --retry 2 \
+              --retry-delay 20 \
+              --retry-all-errors \
+              --request POST \
+              --header "X-TenderOS-Scheduler-Token: ${TENDEROS_SCHEDULER_TOKEN}" \
+              "$TENDEROS_KICK_URL"
+          )"
+
+          cat "$response_file"
+
+          if [ "$http_code" != "202" ]; then
+            echo "TenderOS returned HTTP $http_code; expected 202."
+            exit 1
+          fi
+
+          echo "TenderOS enrichment accepted successfully."
