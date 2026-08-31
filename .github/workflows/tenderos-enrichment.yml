@@ -1,4 +1,4 @@
-# Module 4 identity-first live validation marker: batch-1
+# Render Free long-cycle keepalive: preserve synchronous completion semantics
 name: TenderOS enrichment scheduler
 
 on:
@@ -26,6 +26,8 @@ jobs:
     env:
       TENDEROS_SCHEDULER_TOKEN: ${{ secrets.TENDEROS_SCHEDULER_TOKEN }}
       TENDEROS_RUN_URL: https://tenderos-staging.onrender.com/internal/enrichment/scheduled-run
+      TENDEROS_WAKE_URL: https://tenderos-staging.onrender.com/internal/scheduler/wake
+      TENDEROS_HEARTBEAT_SECONDS: "240"
 
     steps:
       - name: Validate three consecutive completed cycles
@@ -33,24 +35,74 @@ jobs:
         run: |
           set -euo pipefail
 
+          perform_request_with_heartbeat() {
+            response_file="$1"
+            code_file="$(mktemp)"
+
+            curl --silent --show-error \
+              --output "$response_file" \
+              --write-out "%{http_code}" \
+              --max-time 1200 \
+              --connect-timeout 30 \
+              --retry 2 \
+              --retry-delay 20 \
+              --retry-all-errors \
+              --request POST \
+              --header "X-TenderOS-Scheduler-Token: ${TENDEROS_SCHEDULER_TOKEN}" \
+              "$TENDEROS_RUN_URL" > "$code_file" &
+            request_pid=$!
+
+            (
+              while kill -0 "$request_pid" 2>/dev/null; do
+                sleep "$TENDEROS_HEARTBEAT_SECONDS"
+                kill -0 "$request_pid" 2>/dev/null || exit 0
+                wake_code="$(
+                  curl --silent --show-error \
+                    --output /dev/null \
+                    --write-out "%{http_code}" \
+                    --max-time 60 \
+                    --connect-timeout 20 \
+                    --retry 2 \
+                    --retry-delay 5 \
+                    --retry-all-errors \
+                    --header "X-TenderOS-Scheduler-Token: ${TENDEROS_SCHEDULER_TOKEN}" \
+                    "$TENDEROS_WAKE_URL" \
+                  || true
+                )"
+                echo "Render keepalive heartbeat: HTTP ${wake_code:-curl-error}"
+              done
+            ) &
+            heartbeat_pid=$!
+
+            if wait "$request_pid"; then
+              request_exit=0
+            else
+              request_exit=$?
+            fi
+
+            kill "$heartbeat_pid" 2>/dev/null || true
+            wait "$heartbeat_pid" 2>/dev/null || true
+
+            HTTP_CODE="$(cat "$code_file" 2>/dev/null || true)"
+            rm -f "$code_file"
+
+            if [ "$request_exit" -ne 0 ]; then
+              echo "Enrichment request curl exited with code $request_exit."
+              return "$request_exit"
+            fi
+          }
+
           run_cycle() {
             cycle="$1"
             response_file="$(mktemp)"
 
             for lock_attempt in $(seq 1 30); do
-              http_code="$(
-                curl --silent --show-error \
-                  --output "$response_file" \
-                  --write-out "%{http_code}" \
-                  --max-time 1200 \
-                  --connect-timeout 30 \
-                  --retry 2 \
-                  --retry-delay 20 \
-                  --retry-all-errors \
-                  --request POST \
-                  --header "X-TenderOS-Scheduler-Token: ${TENDEROS_SCHEDULER_TOKEN}" \
-                  "$TENDEROS_RUN_URL"
-              )"
+              HTTP_CODE=""
+              if ! perform_request_with_heartbeat "$response_file"; then
+                rm -f "$response_file"
+                return 1
+              fi
+              http_code="$HTTP_CODE"
 
               if [ "$http_code" != "409" ]; then
                 break
@@ -93,22 +145,61 @@ jobs:
           set -euo pipefail
 
           response_file="$(mktemp)"
-          trap 'rm -f "$response_file"' EXIT
+          code_file="$(mktemp)"
+          heartbeat_pid=""
+          trap 'if [ -n "$heartbeat_pid" ]; then kill "$heartbeat_pid" 2>/dev/null || true; fi; rm -f "$response_file" "$code_file"' EXIT
 
-          http_code="$(
-            curl --silent --show-error \
-              --output "$response_file" \
-              --write-out "%{http_code}" \
-              --max-time 1200 \
-              --connect-timeout 30 \
-              --retry 2 \
-              --retry-delay 20 \
-              --retry-all-errors \
-              --request POST \
-              --header "X-TenderOS-Scheduler-Token: ${TENDEROS_SCHEDULER_TOKEN}" \
-              "$TENDEROS_RUN_URL"
-          )"
+          curl --silent --show-error \
+            --output "$response_file" \
+            --write-out "%{http_code}" \
+            --max-time 1200 \
+            --connect-timeout 30 \
+            --retry 2 \
+            --retry-delay 20 \
+            --retry-all-errors \
+            --request POST \
+            --header "X-TenderOS-Scheduler-Token: ${TENDEROS_SCHEDULER_TOKEN}" \
+            "$TENDEROS_RUN_URL" > "$code_file" &
+          request_pid=$!
 
+          (
+            while kill -0 "$request_pid" 2>/dev/null; do
+              sleep "$TENDEROS_HEARTBEAT_SECONDS"
+              kill -0 "$request_pid" 2>/dev/null || exit 0
+              wake_code="$(
+                curl --silent --show-error \
+                  --output /dev/null \
+                  --write-out "%{http_code}" \
+                  --max-time 60 \
+                  --connect-timeout 20 \
+                  --retry 2 \
+                  --retry-delay 5 \
+                  --retry-all-errors \
+                  --header "X-TenderOS-Scheduler-Token: ${TENDEROS_SCHEDULER_TOKEN}" \
+                  "$TENDEROS_WAKE_URL" \
+                || true
+              )"
+              echo "Render keepalive heartbeat: HTTP ${wake_code:-curl-error}"
+            done
+          ) &
+          heartbeat_pid=$!
+
+          if wait "$request_pid"; then
+            request_exit=0
+          else
+            request_exit=$?
+          fi
+
+          kill "$heartbeat_pid" 2>/dev/null || true
+          wait "$heartbeat_pid" 2>/dev/null || true
+          heartbeat_pid=""
+
+          if [ "$request_exit" -ne 0 ]; then
+            echo "Enrichment request curl exited with code $request_exit."
+            exit "$request_exit"
+          fi
+
+          http_code="$(cat "$code_file" 2>/dev/null || true)"
           cat "$response_file"
 
           if [ "$http_code" = "409" ]; then
