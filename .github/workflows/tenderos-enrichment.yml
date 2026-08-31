@@ -52,9 +52,10 @@ jobs:
               "$TENDEROS_RUN_URL" > "$code_file" &
             request_pid=$!
 
-            while kill -0 "$request_pid" 2>/dev/null; do
-              sleep "$TENDEROS_HEARTBEAT_SECONDS"
-              if kill -0 "$request_pid" 2>/dev/null; then
+            (
+              while kill -0 "$request_pid" 2>/dev/null; do
+                sleep "$TENDEROS_HEARTBEAT_SECONDS"
+                kill -0 "$request_pid" 2>/dev/null || exit 0
                 wake_code="$(
                   curl --silent --show-error \
                     --output /dev/null \
@@ -69,14 +70,19 @@ jobs:
                   || true
                 )"
                 echo "Render keepalive heartbeat: HTTP ${wake_code:-curl-error}"
-              fi
-            done
+              done
+            ) &
+            heartbeat_pid=$!
 
             if wait "$request_pid"; then
               request_exit=0
             else
               request_exit=$?
             fi
+
+            kill "$heartbeat_pid" 2>/dev/null || true
+            wait "$heartbeat_pid" 2>/dev/null || true
+
             HTTP_CODE="$(cat "$code_file" 2>/dev/null || true)"
             rm -f "$code_file"
 
@@ -140,7 +146,8 @@ jobs:
 
           response_file="$(mktemp)"
           code_file="$(mktemp)"
-          trap 'rm -f "$response_file" "$code_file"' EXIT
+          heartbeat_pid=""
+          trap 'if [ -n "$heartbeat_pid" ]; then kill "$heartbeat_pid" 2>/dev/null || true; fi; rm -f "$response_file" "$code_file"' EXIT
 
           curl --silent --show-error \
             --output "$response_file" \
@@ -155,9 +162,10 @@ jobs:
             "$TENDEROS_RUN_URL" > "$code_file" &
           request_pid=$!
 
-          while kill -0 "$request_pid" 2>/dev/null; do
-            sleep "$TENDEROS_HEARTBEAT_SECONDS"
-            if kill -0 "$request_pid" 2>/dev/null; then
+          (
+            while kill -0 "$request_pid" 2>/dev/null; do
+              sleep "$TENDEROS_HEARTBEAT_SECONDS"
+              kill -0 "$request_pid" 2>/dev/null || exit 0
               wake_code="$(
                 curl --silent --show-error \
                   --output /dev/null \
@@ -172,14 +180,20 @@ jobs:
                 || true
               )"
               echo "Render keepalive heartbeat: HTTP ${wake_code:-curl-error}"
-            fi
-          done
+            done
+          ) &
+          heartbeat_pid=$!
 
           if wait "$request_pid"; then
             request_exit=0
           else
             request_exit=$?
           fi
+
+          kill "$heartbeat_pid" 2>/dev/null || true
+          wait "$heartbeat_pid" 2>/dev/null || true
+          heartbeat_pid=""
+
           if [ "$request_exit" -ne 0 ]; then
             echo "Enrichment request curl exited with code $request_exit."
             exit "$request_exit"
