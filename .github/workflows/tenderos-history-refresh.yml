@@ -2,6 +2,12 @@ name: TenderOS official history refresh
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - feat/external-history-refresh
+    paths:
+      - ".github/workflows/tenderos-history-refresh.yml"
+      - "scripts/refresh_official_history.py"
 
 permissions:
   contents: read
