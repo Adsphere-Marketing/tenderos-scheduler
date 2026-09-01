@@ -1,0 +1,112 @@
+name: TenderOS deep enrichment probe
+
+on:
+  push:
+    paths:
+      - ".github/workflows/tenderos-deep-probe.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  deep-probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    env:
+      TENDEROS_SCHEDULER_TOKEN: ${{ secrets.TENDEROS_SCHEDULER_TOKEN }}
+      TENDEROS_DEEP_URL: https://tenderos-staging.onrender.com/internal/enrichment/deep-run
+      TENDEROS_CORE_URL: https://tenderos-staging.onrender.com/internal/enrichment/scheduled-run
+      TENDEROS_WAKE_URL: https://tenderos-staging.onrender.com/internal/scheduler/wake
+      HEARTBEAT_SECONDS: "180"
+
+    steps:
+      - name: Run one isolated deep enrichment
+        run: |
+          set -euo pipefail
+          response_file="$(mktemp)"
+          code_file="$(mktemp)"
+          heartbeat_pid=""
+          trap 'if [ -n "$heartbeat_pid" ]; then kill "$heartbeat_pid" 2>/dev/null || true; fi; rm -f "$response_file" "$code_file"' EXIT
+
+          curl --silent --show-error \
+            --output "$response_file" \
+            --write-out "%{http_code}" \
+            --max-time 7200 \
+            --connect-timeout 30 \
+            --request POST \
+            --header "X-TenderOS-Scheduler-Token: ${TENDEROS_SCHEDULER_TOKEN}" \
+            "$TENDEROS_DEEP_URL" > "$code_file" &
+          request_pid=$!
+
+          (
+            while kill -0 "$request_pid" 2>/dev/null; do
+              sleep "$HEARTBEAT_SECONDS"
+              kill -0 "$request_pid" 2>/dev/null || exit 0
+              wake_code="$(
+                curl --silent --show-error \
+                  --output /dev/null \
+                  --write-out "%{http_code}" \
+                  --max-time 60 \
+                  --connect-timeout 20 \
+                  --header "X-TenderOS-Scheduler-Token: ${TENDEROS_SCHEDULER_TOKEN}" \
+                  "$TENDEROS_WAKE_URL" || true
+              )"
+              echo "Deep keepalive heartbeat: HTTP ${wake_code:-curl-error}"
+            done
+          ) &
+          heartbeat_pid=$!
+
+          if wait "$request_pid"; then
+            request_exit=0
+          else
+            request_exit=$?
+          fi
+          kill "$heartbeat_pid" 2>/dev/null || true
+          wait "$heartbeat_pid" 2>/dev/null || true
+          heartbeat_pid=""
+
+          http_code="$(cat "$code_file" 2>/dev/null || true)"
+          echo "=== Deep enrichment response ==="
+          cat "$response_file"
+
+          if [ "$request_exit" -ne 0 ]; then
+            echo "Deep request curl exited with code $request_exit."
+            exit "$request_exit"
+          fi
+          if [ "$http_code" != "200" ]; then
+            echo "Deep endpoint returned HTTP $http_code; expected 200."
+            exit 1
+          fi
+          if ! grep -q '"status":"complete"' "$response_file"; then
+            echo "Deep endpoint did not confirm status=complete."
+            exit 1
+          fi
+
+      - name: Normalize with one bounded core cycle
+        run: |
+          set -euo pipefail
+          response_file="$(mktemp)"
+          http_code="$(
+            curl --silent --show-error \
+              --output "$response_file" \
+              --write-out "%{http_code}" \
+              --max-time 1200 \
+              --connect-timeout 30 \
+              --request POST \
+              --header "X-TenderOS-Scheduler-Token: ${TENDEROS_SCHEDULER_TOKEN}" \
+              "$TENDEROS_CORE_URL"
+          )"
+          echo "=== Post-deep core response ==="
+          cat "$response_file"
+          if [ "$http_code" != "200" ]; then
+            echo "Post-deep core returned HTTP $http_code; expected 200."
+            rm -f "$response_file"
+            exit 1
+          fi
+          if ! grep -q '"status":"complete"' "$response_file"; then
+            echo "Post-deep core did not confirm status=complete."
+            rm -f "$response_file"
+            exit 1
+          fi
+          rm -f "$response_file"
