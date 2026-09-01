@@ -1,0 +1,27 @@
+name: TenderOS official history refresh
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tenderos-official-history-refresh
+  cancel-in-progress: false
+
+jobs:
+  refresh-history:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      TENDEROS_SCHEDULER_TOKEN: ${{ secrets.TENDEROS_SCHEDULER_TOKEN }}
+      TENDEROS_HISTORY_TARGETS_URL: https://tenderos-staging.onrender.com/internal/history/targets
+      TENDEROS_HISTORY_IMPORT_URL: https://tenderos-staging.onrender.com/internal/history/import
+
+    steps:
+      - name: Checkout public scheduler
+        uses: actions/checkout@v4
+
+      - name: Stream and import official CanadaBuys history
+        run: python3 scripts/refresh_official_history.py
