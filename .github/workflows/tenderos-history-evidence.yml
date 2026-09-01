@@ -2,11 +2,6 @@ name: TenderOS history evidence micro-worker
 
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - feat/history-evidence-micro-worker
-    paths:
-      - ".github/workflows/tenderos-history-evidence.yml"
 
 permissions:
   contents: read
