@@ -73,27 +73,7 @@ jobs:
             fi
 
             read -r status mode pending_docs pending_archives cache_docs observations line_cov price_cov docs_processed dataset_fetches < <(
-              python - "$response_file" <<'PY'
-import json
-import sys
-
-with open(sys.argv[1], "r", encoding="utf-8") as handle:
-    row = json.load(handle)
-
-values = (
-    str(row.get("status") or ""),
-    str(row.get("mode") or ""),
-    int(row.get("history_line_pending_documents") or 0),
-    int(row.get("history_line_pending_archive_lookups") or 0),
-    int(row.get("history_line_cache_documents") or 0),
-    int(row.get("history_line_cache_observations") or 0),
-    int(row.get("historical_line_coverage_pct") or 0),
-    int(row.get("historical_price_coverage_pct") or 0),
-    int(row.get("history_line_documents_processed") or 0),
-    int(row.get("history_line_dataset_fetches") or 0),
-)
-print(*values)
-PY
+              python -c 'import json,sys; r=json.load(open(sys.argv[1], encoding="utf-8")); print(str(r.get("status") or ""), str(r.get("mode") or ""), int(r.get("history_line_pending_documents") or 0), int(r.get("history_line_pending_archive_lookups") or 0), int(r.get("history_line_cache_documents") or 0), int(r.get("history_line_cache_observations") or 0), int(r.get("historical_line_coverage_pct") or 0), int(r.get("historical_price_coverage_pct") or 0), int(r.get("history_line_documents_processed") or 0), int(r.get("history_line_dataset_fetches") or 0))' "$response_file"
             )
 
             rm -f "$response_file"
