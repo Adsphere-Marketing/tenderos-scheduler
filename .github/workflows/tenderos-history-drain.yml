@@ -1,0 +1,132 @@
+name: TenderOS history evidence drain
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - feat/history-evidence-drain
+    paths:
+      - .github/workflows/tenderos-history-drain.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tenderos-history-evidence-drain
+  cancel-in-progress: false
+
+jobs:
+  drain:
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    env:
+      TENDEROS_SCHEDULER_TOKEN: ${{ secrets.TENDEROS_SCHEDULER_TOKEN }}
+      TENDEROS_HISTORY_EVIDENCE_URL: https://tenderos-staging.onrender.com/internal/history/evidence-run
+
+    steps:
+      - name: Drain bounded history evidence until complete or terminal
+        run: |
+          set -euo pipefail
+
+          previous_signature=""
+          stagnant_passes=0
+          completed_passes=0
+
+          for pass in $(seq 1 36); do
+            echo "=== bounded history pass ${pass}/36 ==="
+            response_file="$(mktemp)"
+            trap 'rm -f "$response_file"' EXIT
+
+            set +e
+            http_code="$(
+              curl --silent --show-error \
+                --output "$response_file" \
+                --write-out "%{http_code}" \
+                --max-time 1500 \
+                --connect-timeout 30 \
+                --request POST \
+                --header "X-TenderOS-Scheduler-Token: ${TENDEROS_SCHEDULER_TOKEN}" \
+                "$TENDEROS_HISTORY_EVIDENCE_URL"
+            )"
+            curl_status=$?
+            set -e
+
+            if [ "$curl_status" -ne 0 ]; then
+              echo "History evidence transport failed with curl status ${curl_status}."
+              exit 1
+            fi
+
+            if [ "$http_code" = "409" ]; then
+              echo "Authoritative TenderOS writer is busy; retrying later without treating overlap as failure."
+              rm -f "$response_file"
+              trap - EXIT
+              sleep 20
+              continue
+            fi
+
+            cat "$response_file"
+            echo
+
+            if [ "$http_code" != "200" ]; then
+              echo "History evidence worker returned HTTP ${http_code}; expected 200."
+              exit 1
+            fi
+
+            read -r status mode pending_docs pending_archives cache_docs observations line_cov price_cov docs_processed dataset_fetches < <(
+              python - "$response_file" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], "r", encoding="utf-8") as handle:
+    row = json.load(handle)
+
+values = (
+    str(row.get("status") or ""),
+    str(row.get("mode") or ""),
+    int(row.get("history_line_pending_documents") or 0),
+    int(row.get("history_line_pending_archive_lookups") or 0),
+    int(row.get("history_line_cache_documents") or 0),
+    int(row.get("history_line_cache_observations") or 0),
+    int(row.get("historical_line_coverage_pct") or 0),
+    int(row.get("historical_price_coverage_pct") or 0),
+    int(row.get("history_line_documents_processed") or 0),
+    int(row.get("history_line_dataset_fetches") or 0),
+)
+print(*values)
+PY
+            )
+
+            rm -f "$response_file"
+            trap - EXIT
+
+            if [ "$status" != "complete" ] || [ "$mode" != "history_evidence_micro" ]; then
+              echo "History evidence response violated the completion contract."
+              exit 1
+            fi
+
+            completed_passes=$((completed_passes + 1))
+            echo "State: pending_docs=${pending_docs} pending_archives=${pending_archives} cache_docs=${cache_docs} observations=${observations} line_coverage=${line_cov}% price_coverage=${price_cov}%"
+
+            if [ "$pending_docs" -eq 0 ] && [ "$pending_archives" -eq 0 ]; then
+              echo "History evidence backlog is fully processed or terminalized."
+              exit 0
+            fi
+
+            signature="${pending_docs}:${pending_archives}:${cache_docs}:${observations}:${line_cov}:${price_cov}"
+            if [ "$signature" = "$previous_signature" ] && [ "$docs_processed" -eq 0 ] && [ "$dataset_fetches" -eq 0 ]; then
+              stagnant_passes=$((stagnant_passes + 1))
+            else
+              stagnant_passes=0
+            fi
+            previous_signature="$signature"
+
+            if [ "$stagnant_passes" -ge 2 ]; then
+              echo "No progress across three bounded states; stopping as terminal/no-work instead of looping."
+              exit 0
+            fi
+
+            sleep 5
+          done
+
+          echo "Reached the hard 36-pass orchestration ceiling after ${completed_passes} completed passes."
+          exit 0
